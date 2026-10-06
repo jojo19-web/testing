@@ -1,0 +1,78 @@
+package com.eggplant.detector.detection.api
+
+import com.eggplant.detector.detection.ncnn.ModelMetadata
+
+data class DetectionGateDecision(
+    val accepted: Boolean,
+    val reason: String,
+)
+
+object DetectionGate {
+    const val LIVE_CONFIDENCE_THRESHOLD = 0.12f
+    // Keep still-image acceptance aligned with the model's native floor. The
+    // temporal stability tracker remains the separate live-preview guard.
+    const val CAPTURE_CONFIDENCE_THRESHOLD = 0.12f
+    const val GALLERY_CONFIDENCE_THRESHOLD = 0.12f
+    const val FRUIT_BORER_CONFIDENCE_THRESHOLD = 0.25f
+    const val HEALTHY_CONFIDENCE_THRESHOLD = 0.25f
+    const val LIVE_MIN_BOX_AREA = 0.0025f
+    const val LIVE_MAX_BOX_AREA = 1.0f
+    const val STILL_MIN_BOX_AREA = 0.0025f
+    const val STILL_MAX_BOX_AREA = 1.0f
+
+    fun filter(frame: DetectionFrame, onRejected: ((DetectionBox, DetectionGateDecision) -> Unit)? = null): DetectionFrame {
+        val accepted = frame.detections.filter { detection ->
+            val decision = evaluate(detection, frame.source)
+            if (!decision.accepted) onRejected?.invoke(detection, decision)
+            decision.accepted
+        }
+        return frame.copy(detections = accepted)
+    }
+
+    fun evaluate(detection: DetectionBox, source: InputSource): DetectionGateDecision {
+        val sourceThreshold = thresholdFor(source)
+        val fruitBorerThreshold = if (detection.modelClass.index == ModelMetadata.FRUIT_BORER_CLASS_INDEX) {
+            FRUIT_BORER_CONFIDENCE_THRESHOLD
+        } else {
+            null
+        }
+        val healthyThreshold = if (detection.modelClass.isHealthy) {
+            HEALTHY_CONFIDENCE_THRESHOLD
+        } else {
+            null
+        }
+        val requiredConfidence = fruitBorerThreshold ?: healthyThreshold ?: sourceThreshold
+        if (detection.confidence < requiredConfidence) {
+            return DetectionGateDecision(
+                accepted = false,
+                reason = when {
+                    fruitBorerThreshold != null -> "confidence_below_fruit_borer_override"
+                    healthyThreshold != null -> "confidence_below_healthy_override"
+                    else -> "confidence_below_${source.name.lowercase()}_threshold"
+                },
+            )
+        }
+
+        val area = detection.bounds.area()
+        val (minArea, maxArea) = areaLimitsFor(source)
+        return when {
+            area < minArea -> DetectionGateDecision(false, "box_area_too_small")
+            area > maxArea -> DetectionGateDecision(false, "box_area_too_large")
+            else -> DetectionGateDecision(true, "accepted")
+        }
+    }
+
+    fun thresholdFor(source: InputSource): Float = when (source) {
+        InputSource.LIVE -> LIVE_CONFIDENCE_THRESHOLD
+        InputSource.CAPTURE -> CAPTURE_CONFIDENCE_THRESHOLD
+        InputSource.GALLERY -> GALLERY_CONFIDENCE_THRESHOLD
+    }
+
+    fun areaLimitsFor(source: InputSource): Pair<Float, Float> = when (source) {
+        InputSource.LIVE -> LIVE_MIN_BOX_AREA to LIVE_MAX_BOX_AREA
+        InputSource.CAPTURE,
+        InputSource.GALLERY -> STILL_MIN_BOX_AREA to STILL_MAX_BOX_AREA
+    }
+
+    private fun NormalizedBox.area(): Float = (right - left) * (bottom - top)
+}

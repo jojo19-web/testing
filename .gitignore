@@ -1,0 +1,22 @@
+.gradle/
+.DS_Store
+.kotlin/
+.idea/
+build/
+**/build/
+local.properties
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+.vercel/
+.playwright-cli/
+output/
+supabase/.temp/
+__pycache__/
+# Ignore newly generated model-development artifacts. The selected dataset
+# pointer and evaluation evidence already tracked under ml/ remain versioned.
+ml/*
+!ml/README.md
+.vercel
+.gstack/

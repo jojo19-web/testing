@@ -1,0 +1,291 @@
+import { timingSafeEqual } from "node:crypto";
+import { NextResponse } from "next/server";
+import { getAdminClient } from "@/lib/supabase/admin";
+import {
+  processStorageCleanupBatch,
+  type StorageCleanupEntry,
+} from "@/lib/storage-cleanup";
+
+export async function GET(request: Request) {
+  const expected = process.env.CRON_SECRET;
+  const authorization = request.headers.get("authorization");
+  const provided = authorization?.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : null;
+  if (!expected || !provided || !secureEqual(expected, provided)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const supabase = getAdminClient();
+  const storageCleanup = await processStorageCleanupBatch({
+    claim: async (limit) => {
+      const { data, error } = await supabase.rpc(
+        "claim_storage_cleanup_batch",
+        { p_limit: limit },
+      );
+      if (error || !Array.isArray(data)) {
+        throw new Error("Storage cleanup could not claim its queue.");
+      }
+      return data.map(parseStorageCleanupEntry);
+    },
+    remove: async (bucketId, objectPath) => {
+      if (bucketId !== "eggplant-scans") return false;
+      const { error } = await supabase.storage
+        .from(bucketId)
+        .remove([objectPath]);
+      return !error;
+    },
+    acknowledge: async (cleanupId, succeeded, errorCode) => {
+      const { data, error } = await supabase.rpc(
+        "acknowledge_storage_cleanup",
+        {
+          p_cleanup_id: cleanupId,
+          p_succeeded: succeeded,
+          p_error_code: errorCode,
+        },
+      );
+      return !error && data === true;
+    },
+  });
+  const now = new Date().toISOString();
+  const { data: expiring, error: expirationReadError } = await supabase
+    .from("scan_contributions")
+    .select("id,photo_path,annotated_photo_path")
+    .eq("status", "published")
+    .lte("expires_at", now)
+    .order("expires_at")
+    .limit(100);
+  if (expirationReadError) {
+    return NextResponse.json(
+      { error: "Expiration maintenance could not read its queue." },
+      { status: 500 },
+    );
+  }
+  const expired = expiring ?? [];
+  let expiredPhotoCleanupFailed = false;
+  let expirationStatusUpdateFailed = false;
+  let expiredScansUnpublished = 0;
+  if (expired.length > 0) {
+    const expiredPhotoPaths = expired.flatMap((row) =>
+      [row.photo_path, row.annotated_photo_path].filter((path): path is string => Boolean(path)),
+    );
+    const { error } = await supabase.storage
+      .from("eggplant-scans")
+      .remove(expiredPhotoPaths);
+    expiredPhotoCleanupFailed = Boolean(error);
+    if (!error) {
+      const expiredIds = expired.map((row) => row.id);
+      const { error: updateError } = await supabase
+        .from("scan_contributions")
+        .update({ status: "expired" })
+        .in("id", expiredIds)
+        .eq("status", "published");
+      expirationStatusUpdateFailed = Boolean(updateError);
+      if (!updateError) expiredScansUnpublished = expiredIds.length;
+    }
+  }
+
+  const pendingIntentCutoff = new Date(Date.now() - 2 * 60 * 60 * 1_000).toISOString();
+  const completedIntentCutoff = new Date(Date.now() - 181 * 24 * 60 * 60 * 1_000).toISOString();
+  const { data: staleIntents = [], error: intentReadError } = await supabase
+    .from("global_share_intents")
+    .select("id,photo_path,annotated_photo_path,status")
+    .or(`and(status.eq.pending,created_at.lt.${pendingIntentCutoff}),and(status.eq.completed,created_at.lt.${completedIntentCutoff})`)
+    .limit(200);
+  if (intentReadError) {
+    return NextResponse.json(
+      { error: "Expired upload intents could not be read." },
+      { status: 500 },
+    );
+  }
+  const pendingIntents = (staleIntents ?? []).filter((intent) => intent.status !== "completed");
+  let intentCleanupFailed = false;
+  if (pendingIntents.length > 0) {
+    const pendingIntentPaths = pendingIntents.flatMap((intent) =>
+      [intent.photo_path, intent.annotated_photo_path].filter((path): path is string => Boolean(path)),
+    );
+    const { error } = await supabase.storage
+      .from("eggplant-scans")
+      .remove(pendingIntentPaths);
+    intentCleanupFailed = Boolean(error);
+  }
+  const removableIntentIds = (staleIntents ?? [])
+    .filter((intent) => intent.status === "completed" || !intentCleanupFailed)
+    .map((intent) => intent.id);
+  if (removableIntentIds.length > 0) {
+    const { error } = await supabase
+      .from("global_share_intents")
+      .delete()
+      .in("id", removableIntentIds);
+    intentCleanupFailed = intentCleanupFailed || Boolean(error);
+  }
+  const rateLimitCutoff = new Date();
+  rateLimitCutoff.setUTCDate(rateLimitCutoff.getUTCDate() - 2);
+  const { error: rateLimitCleanupError } = await supabase
+    .from("api_rate_limits")
+    .delete()
+    .lt("window_start", rateLimitCutoff.toISOString().slice(0, 10));
+
+  const { data: deletions, error: deletionReadError } = await supabase
+    .from("deletion_requests")
+    .select("id,owner_id,attempt_count")
+    .in("status", ["queued", "processing", "failed"])
+    .order("created_at")
+    .limit(20);
+  if (deletionReadError) {
+    return NextResponse.json(
+      { error: "Deletion maintenance could not read its queue." },
+      { status: 500 },
+    );
+  }
+
+  let completed = 0;
+  let failed = 0;
+  for (const deletion of deletions ?? []) {
+    const { error: processingError } = await supabase
+      .from("deletion_requests")
+      .update({ status: "processing", attempt_count: deletion.attempt_count + 1, last_error_code: null })
+      .eq("id", deletion.id);
+    if (processingError) {
+      failed += 1;
+      continue;
+    }
+
+    // Delete exactly the immutable snapshot created with the request. Never
+    // query by owner here: the owner may have opted back into sharing since.
+    const { data: targets, error: targetReadError } = await supabase
+      .from("deletion_request_targets")
+      .select("resource_type,resource_id,photo_path,annotated_photo_path")
+      .eq("deletion_request_id", deletion.id);
+    if (targetReadError) {
+      await markDeletionFailed(deletion.id);
+      failed += 1;
+      continue;
+    }
+    const targetRows = targets ?? [];
+    const contributionIds = targetRows
+      .filter((target) => target.resource_type === "scan_contribution")
+      .map((target) => target.resource_id);
+    const shareIntentIds = targetRows
+      .filter((target) => target.resource_type === "global_share_intent")
+      .map((target) => target.resource_id);
+    const paths = [...new Set([
+      ...targetRows.map((target) => target.photo_path),
+      ...targetRows.map((target) => target.annotated_photo_path),
+    ].filter((path): path is string => Boolean(path)))];
+    if (paths.length > 0) {
+      const { error } = await supabase.storage
+        .from("eggplant-scans")
+        .remove(paths);
+      if (error) {
+        await markDeletionFailed(deletion.id);
+        failed += 1;
+        continue;
+      }
+    }
+
+    const mutations = await Promise.all([
+      contributionIds.length > 0
+        ? supabase
+          .from("scan_contributions")
+          .delete()
+          .eq("owner_id", deletion.owner_id)
+          .in("id", contributionIds)
+        : Promise.resolve({ error: null }),
+      shareIntentIds.length > 0
+        ? supabase
+          .from("global_share_intents")
+          .delete()
+          .eq("owner_id", deletion.owner_id)
+          .in("id", shareIntentIds)
+        : Promise.resolve({ error: null }),
+    ]);
+    if (mutations.some((mutation) => mutation.error)) {
+      await markDeletionFailed(deletion.id);
+      failed += 1;
+      continue;
+    }
+    const { error: completionError } = await supabase
+      .from("deletion_requests")
+      .update({ status: "completed", completed_at: new Date().toISOString(), last_error_code: null })
+      .eq("id", deletion.id);
+    if (completionError) {
+      await markDeletionFailed(deletion.id);
+      failed += 1;
+      continue;
+    }
+    completed += 1;
+  }
+
+  const storageCleanupFailed =
+    storageCleanup.claimFailed ||
+    storageCleanup.retriesQueued > 0 ||
+    storageCleanup.acknowledgementFailures > 0;
+  const status = expiredPhotoCleanupFailed || expirationStatusUpdateFailed || intentCleanupFailed || rateLimitCleanupError || storageCleanupFailed || failed > 0 ? 500 : 200;
+  return NextResponse.json(
+    {
+      storageCleanupClaimed: storageCleanup.claimed,
+      storageCleanupCompleted: storageCleanup.completed,
+      storageCleanupRetriesQueued: storageCleanup.retriesQueued,
+      storageCleanupAcknowledgementFailures:
+        storageCleanup.acknowledgementFailures,
+      storageCleanupClaimFailed: storageCleanup.claimFailed,
+      expiredScansUnpublished,
+      expiredPhotosPendingCleanup: expiredPhotoCleanupFailed,
+      expirationStatusUpdateFailed,
+      uploadIntentsRemoved: removableIntentIds.length,
+      uploadIntentCleanupFailed: intentCleanupFailed,
+      rateLimitCleanupFailed: Boolean(rateLimitCleanupError),
+      deletionRequestsCompleted: completed,
+      deletionRequestsFailed: failed,
+    },
+    { status },
+  );
+
+  async function markDeletionFailed(id: string) {
+    await supabase
+      .from("deletion_requests")
+      .update({ status: "failed", last_error_code: "shared_cleanup_failed" })
+      .eq("id", id);
+  }
+}
+
+function secureEqual(expected: string, provided: string) {
+  const expectedBytes = Buffer.from(expected);
+  const providedBytes = Buffer.from(provided);
+  return (
+    expectedBytes.length === providedBytes.length &&
+    timingSafeEqual(expectedBytes, providedBytes)
+  );
+}
+
+function parseStorageCleanupEntry(value: unknown): StorageCleanupEntry {
+  if (!isRecord(value)) {
+    throw new Error("Storage cleanup returned an invalid queue row.");
+  }
+  const cleanupId = value.cleanup_id;
+  const bucketId = value.cleanup_bucket_id;
+  const objectPath = value.cleanup_object_path;
+  const attemptCount = value.cleanup_attempt_count;
+  if (
+    typeof cleanupId !== "string" ||
+    !UUID_PATTERN.test(cleanupId) ||
+    bucketId !== "eggplant-scans" ||
+    typeof objectPath !== "string" ||
+    objectPath.length < 1 ||
+    objectPath.length > 1_024 ||
+    typeof attemptCount !== "number" ||
+    !Number.isSafeInteger(attemptCount) ||
+    attemptCount < 1
+  ) {
+    throw new Error("Storage cleanup returned an invalid queue row.");
+  }
+  return { cleanupId, bucketId, objectPath, attemptCount };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
